@@ -75,6 +75,7 @@ func (this *Fixturer) InitFixtures() error {
 	return nil
 }
 
+//recreateDatabase
 func (this *Fixturer) recreateDatabase() error {
 	var dbName string
 	err := this.db.QueryRow("select database() as dbName").Scan(&dbName)
@@ -100,6 +101,7 @@ func (this *Fixturer) recreateDatabase() error {
 	return nil
 }
 
+//createTables
 func (this *Fixturer) createTables() error {
 	log.Println("Create tables")
 	if file, err := ioutil.ReadFile(this.schema); err == nil {
@@ -121,6 +123,7 @@ func (this *Fixturer) createTables() error {
 	return nil
 }
 
+//initYmlFixtures
 func (this *Fixturer) initYmlFixtures() error {
 	log.Println("Init YML fixtures")
 	var err error
@@ -148,6 +151,7 @@ func (this *Fixturer) initYmlFixtures() error {
 	return nil
 }
 
+//getInsertQueriesFromYml
 func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, error) {
 	var err error
 	insertQueries := []*squirrel.InsertBuilder{}
@@ -213,6 +217,7 @@ func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, erro
 	return insertQueries, nil
 }
 
+//generateCsvFixtures
 func (this *Fixturer) generateCsvFixtures() error {
 	log.Println("Generate CSV fixtures")
 	suiteCsvFixturesPath := this.fixturesPathCsv + "/" + this.databaseSuffix
@@ -249,6 +254,7 @@ func (this *Fixturer) generateCsvFixtures() error {
 	return nil
 }
 
+//LoadCsvFixtures
 func (this *Fixturer) LoadCsvFixtures() error {
 	log.Println("Load CSV fixtures")
 	var err error
