@@ -5,11 +5,10 @@ import (
 	"log"
 	"strings"
 
+	"bitbucket.org/lazadaweb/squirrel"
+	"database/sql"
 	yaml "gopkg.in/yaml.v2"
 	"os"
-	"database/sql"
-	"fmt"
-	"bitbucket.org/lazadaweb/squirrel"
 )
 
 // EsSyncService represents elastic search sync service
@@ -20,11 +19,11 @@ type IFixturer interface {
 
 // EsSyncService represents elastic search sync service
 type Fixturer struct {
-	db *sql.DB
-	schema string
+	db              *sql.DB
+	schema          string
 	fixturesPathYml string
 	fixturesPathCsv string
-	databaseSuffix string
+	databaseSuffix  string
 }
 
 // NewEsSyncServer create and returns new instance of sync service
@@ -33,21 +32,20 @@ func NewFixturer(dbConf, schema, fixturesPathYml string, fixturesPathCsv string,
 	db, err := sql.Open("mysql", dbConf)
 
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 	}
 
 	return &Fixturer{
-		db : db,
-		schema : schema,
-		fixturesPathYml : fixturesPathYml,
-		fixturesPathCsv : fixturesPathCsv,
-		databaseSuffix : databaseSuffix,
+		db:              db,
+		schema:          schema,
+		fixturesPathYml: fixturesPathYml,
+		fixturesPathCsv: fixturesPathCsv,
+		databaseSuffix:  databaseSuffix,
 	}
 }
 
 // InitFixtures load and import test fixtures to test database
-func (this *Fixturer)InitFixtures() error {
-consoleLog("InitFixtures", 0)
+func (this *Fixturer) InitFixtures() error {
 	_, err := this.db.Exec("SET FOREIGN_KEY_CHECKS=0")
 	if err != nil {
 		return err
@@ -77,8 +75,7 @@ consoleLog("InitFixtures", 0)
 	return nil
 }
 
-
-func (this *Fixturer)recreateDatabase() error {
+func (this *Fixturer) recreateDatabase() error {
 	var dbName string
 	err := this.db.QueryRow("select database() as dbName").Scan(&dbName)
 	if err != nil {
@@ -103,9 +100,8 @@ func (this *Fixturer)recreateDatabase() error {
 	return nil
 }
 
-
-func (this *Fixturer)createTables() error {
-	consoleLog("createTables", 1)
+func (this *Fixturer) createTables() error {
+	log.Println("Create tables")
 	if file, err := ioutil.ReadFile(this.schema); err == nil {
 		queries := strings.Split(string(file), ";")
 
@@ -115,7 +111,6 @@ func (this *Fixturer)createTables() error {
 				continue
 			}
 			if _, err := this.db.Exec(query); err != nil {
-				fmt.Printf("#%v\n", this.db)
 				return err
 			}
 		}
@@ -126,7 +121,8 @@ func (this *Fixturer)createTables() error {
 	return nil
 }
 
-func (this *Fixturer)initYmlFixtures() error {
+func (this *Fixturer) initYmlFixtures() error {
+	log.Println("Init YML fixtures")
 	var err error
 	_, err = this.db.Exec("SET FOREIGN_KEY_CHECKS=0")
 	if err != nil {
@@ -138,10 +134,10 @@ func (this *Fixturer)initYmlFixtures() error {
 	insertQueries, err := this.getInsertQueriesFromYml()
 
 	for _, insertQuerie := range insertQueries {
-		queryString,queryValues,queryError := insertQuerie.ToSql()
+		queryString, queryValues, err := insertQuerie.ToSql()
 
-		if queryError != nil {
-			fmt.Println(queryError)
+		if err != nil {
+			return err
 		}
 
 		if _, err := this.db.Exec(queryString, queryValues...); err != nil {
@@ -152,7 +148,7 @@ func (this *Fixturer)initYmlFixtures() error {
 	return nil
 }
 
-func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, error){
+func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, error) {
 	var err error
 	insertQueries := []*squirrel.InsertBuilder{}
 
@@ -163,7 +159,6 @@ func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, erro
 	chEnd := make(chan bool)
 
 	if err != nil {
-		log.Println(err)
 		return nil, err
 	}
 
@@ -179,7 +174,6 @@ func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, erro
 
 			if err := yaml.Unmarshal(y, &data); err != nil {
 				log.Printf("Cant't read fixture %q. Origin error: %v", filename, err)
-				log.Println(err)
 			}
 
 			tableName := strings.TrimSuffix(filename, ".yml")
@@ -201,63 +195,26 @@ func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, erro
 		}(f)
 	}
 
-	i:= 0
+	i := 0
 	for {
 		select {
 		case insertQuerie := <-chData:
 			insertQueries = append(insertQueries, insertQuerie)
 		case endData := <-chEnd:
 			if endData == true {
-				i++;
-				if i == filesCount{
-					return  insertQueries, nil
+				i++
+				if i == filesCount {
+					return insertQueries, nil
 				}
 			}
 		}
-//		fmt.Println("Eto counter :", endData, " HE PaBNo :", filesCount)
 	}
 
-	return  insertQueries, nil
+	return insertQueries, nil
 }
 
-func (this *Fixturer)loadYmlFixtures(filename string) error {
-
-	data := make([]map[string]interface{}, 0, 10)
-
-	y, _ := ioutil.ReadFile(this.fixturesPathYml + "/" + filename)
-
-	if err := yaml.Unmarshal(y, &data); err != nil {
-		log.Printf("Cant't read fixture %q. Origin error: %v", filename, err)
-		return err
-	}
-
-	tableName := strings.TrimSuffix(filename, ".yml")
-
-	for _, item := range data {
-		keys := make([]string, 0, len(item))
-		values := make([]interface{}, 0, len(item))
-		for k, v := range item {
-			keys = append(keys, k)
-			values = append(values, v)
-		}
-
-		qb := squirrel.Insert(tableName).Columns(keys...).Values(values...)
-		queryString,queryValues,queryError := qb.ToSql()
-
-		if queryError != nil {
-			fmt.Println(queryError)
-		}
-
-		if _, err := this.db.Exec(queryString, queryValues...); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (this *Fixturer)generateCsvFixtures() error {
-	consoleLog("generateCsvFixtures", 3)
+func (this *Fixturer) generateCsvFixtures() error {
+	log.Println("Generate CSV fixtures")
 	suiteCsvFixturesPath := this.fixturesPathCsv + "/" + this.databaseSuffix
 
 	info, _ := os.Stat(suiteCsvFixturesPath)
@@ -292,8 +249,8 @@ func (this *Fixturer)generateCsvFixtures() error {
 	return nil
 }
 
-func (this *Fixturer)LoadCsvFixtures() error {
-	consoleLog("LoadCsvFixtures", 4)
+func (this *Fixturer) LoadCsvFixtures() error {
+	log.Println("Load CSV fixtures")
 	var err error
 	_, err = this.db.Exec("SET FOREIGN_KEY_CHECKS=0")
 	if err != nil {
@@ -306,7 +263,7 @@ func (this *Fixturer)LoadCsvFixtures() error {
 	files, _ := ioutil.ReadDir(suiteCsvFixturesPath)
 
 	if cap(files) == 0 {
-		consoleLog("Csv Fixtures not load !!!!", 5)
+		log.Printf("Empty %s dir", suiteCsvFixturesPath)
 	}
 
 	for _, f := range files {
@@ -335,21 +292,4 @@ func (this *Fixturer)LoadCsvFixtures() error {
 	}
 
 	return nil
-}
-
-func consoleLog(param string, colorNum int64) {
-	color := []string{
-		"\033[0;31m",
-		"\033[0;32m",
-		"\033[0;33m",
-		"\033[0;34m",
-		"\033[0;35m",
-		"\033[0;36m",
-		"\033[0;37m",
-		"\033[0;38m",
-		"\033[0;39m",
-		"\033[0;41m",
-		"\033[0;42m",
-	}
-	fmt.Println(color[colorNum] + param + "\033[0m")
 }
