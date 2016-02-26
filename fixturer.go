@@ -1,173 +1,230 @@
 package fixturer
 
 import (
+	"database/sql"
+	"fmt"
+	_ "github.com/go-sql-driver/mysql"
 	"io/ioutil"
 	"log"
+	"os"
 	"strings"
+	"sync"
 
 	"bitbucket.org/lazadaweb/squirrel"
-	"database/sql"
+	"flag"
 	yaml "gopkg.in/yaml.v2"
-	"os"
 )
 
-// EsSyncService represents elastic search sync service
 type IFixturer interface {
-	InitFixtures() error
-	LoadCsvFixtures() error
+	RecreateDatabaseWithSchemaAndImportFixtures() error
+	RecreateDatabase() error
+	LoadDbSchema() error
+	ImportFixtures() error
+
+	SetInsertGoroutinesCnt(int) IFixturer
 }
 
-// EsSyncService represents elastic search sync service
 type Fixturer struct {
-	db              *sql.DB
-	schema          string
-	fixturesPathYml string
-	fixturesPathCsv string
-	databaseSuffix  string
+	db                  *sql.DB
+	dbConf              string
+	schema              string
+	fixturesPathYml     string
+	recreateDatabase    bool
+	dbName              string
+	dbParams            string
+	insertGoroutinesCnt int
 }
 
-// NewEsSyncServer create and returns new instance of sync service
-//example dbConf root:222333@tcp(127.0.0.1:3306)/lazada_catalog?loc=Local&parseTime=true&interpolateParams=true
-func NewFixturer(dbConf, schema, fixturesPathYml string, fixturesPathCsv string, databaseSuffix string) IFixturer {
-	db, err := sql.Open("mysql", dbConf)
+type insertQuery struct {
+	qb   *squirrel.InsertBuilder
+	file string
+}
 
-	if err != nil {
-		log.Println(err)
-	}
+const (
+	InsertChannelCapacity      = 1000
+	InsertGoroutinesDefaultCnt = 20
+)
 
+var (
+	finishedTablseNames = []string{}
+	finishedParsedDirs  = map[string]struct{}{}
+	insertMap           = map[string]*squirrel.InsertBuilder{}
+	recreateDatabase    = flag.Bool("recreateDatabase", true, "Do i need to recreate the database? default - true")
+)
+
+// NewFixturer create and returns new instance of &Fixturer.
+// example dbConf root:222333@tcp(127.0.0.1:3306)/
+func NewFixturer(dbConf, schema, fixturesPathYml, dbName, dbParams string) IFixturer {
 	return &Fixturer{
-		db:              db,
-		schema:          schema,
-		fixturesPathYml: fixturesPathYml,
-		fixturesPathCsv: fixturesPathCsv,
-		databaseSuffix:  databaseSuffix,
+		db:               nil,
+		dbConf:           dbConf,
+		schema:           schema,
+		fixturesPathYml:  fixturesPathYml,
+		recreateDatabase: *recreateDatabase,
+		dbName:           dbName,
+		dbParams:         dbParams,
+
+		insertGoroutinesCnt: InsertGoroutinesDefaultCnt,
 	}
+}
+
+// SetInsertGoroutinesCnt sets count of goroutines to perform table inserts.
+func (this *Fixturer) SetInsertGoroutinesCnt(cnt int) IFixturer {
+	if cnt < 1 {
+		panic("Insert goroutines count must be > 1.")
+	}
+	this.insertGoroutinesCnt = cnt
+	return this
+}
+
+func (this *Fixturer) RecreateDatabaseWithSchemaAndImportFixtures() error {
+
+	if this.recreateDatabase == true {
+		if err := this.RecreateDatabase(); err != nil {
+			return err
+		}
+		if err := this.LoadDbSchema(); err != nil {
+			return err
+		}
+	}
+	return this.ImportFixtures()
 }
 
 // InitFixtures load and import test fixtures to test database
-func (this *Fixturer) InitFixtures() error {
-	_, err := this.db.Exec("SET FOREIGN_KEY_CHECKS=0")
-	if err != nil {
-		return err
-	}
-	defer this.db.Exec("SET FOREIGN_KEY_CHECKS=1")
-
-	err = this.recreateDatabase()
+func (this *Fixturer) ImportFixtures() error {
+	files, err := this.getYmlFilesList(this.fixturesPathYml)
 	if err != nil {
 		return err
 	}
 
-	err = this.createTables()
-	if err != nil {
+	if err := this.ensureDbConnected(); err != nil {
 		return err
 	}
+	defer this.ensureDbDisconnected()
 
-	err = this.initYmlFixtures()
-	if err != nil {
-		return err
-	}
-
-	err = this.generateCsvFixtures()
-	if err != nil {
+	if err := this.importYmlFixtures(files); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-//recreateDatabase
-func (this *Fixturer) recreateDatabase() error {
-	var dbName string
-	err := this.db.QueryRow("select database() as dbName").Scan(&dbName)
+// RecreateDatabase drops existing database and creates a clean one.
+func (this *Fixturer) RecreateDatabase() error {
+
+	// this.db is not used because this.db must be connected to the existing database that might not exists at the moment.
+	db, err := sql.Open("mysql", this.dbConf)
+
 	if err != nil {
 		return err
 	}
-
-	log.Printf("Drop %s", dbName)
-	if _, err := this.db.Exec("DROP DATABASE IF EXISTS " + dbName); err != nil {
+	log.Printf("Drop database %s", this.dbName)
+	if _, err := db.Exec("DROP DATABASE IF EXISTS " + this.dbName); err != nil {
 		return err
 	}
-
-	log.Printf("Create %s", dbName)
-	if _, err := this.db.Exec("CREATE DATABASE IF NOT EXISTS " + dbName); err != nil {
+	log.Printf("Create database %s", this.dbName)
+	if _, err := db.Exec("CREATE DATABASE " + this.dbName); err != nil {
 		return err
 	}
-
-	log.Printf("Use %s", dbName)
-	if _, err := this.db.Exec("USE " + dbName); err != nil {
-		return err
-	}
+	db.Close()
 
 	return nil
 }
 
-//createTables
-func (this *Fixturer) createTables() error {
-	log.Println("Create tables")
-	if file, err := ioutil.ReadFile(this.schema); err == nil {
-		queries := strings.Split(string(file), ";")
+// The return value of the function is intentionally left []os.FileInfo (but not []string)
+// for the case when more file info needed.
+func (this *Fixturer) getYmlFilesList(path string) ([]os.FileInfo, error) {
 
-		for i := range queries {
-			query := strings.TrimSpace(queries[i])
-			if len(query) == 0 {
-				continue
-			}
-			if _, err := this.db.Exec(query); err != nil {
-				return err
-			}
-		}
-	} else {
-		return err
-	}
-
-	return nil
-}
-
-//initYmlFixtures
-func (this *Fixturer) initYmlFixtures() error {
-	log.Println("Init YML fixtures")
-	var err error
-	_, err = this.db.Exec("SET FOREIGN_KEY_CHECKS=0")
-	if err != nil {
-		log.Println(err)
-		return err
-	}
-	defer this.db.Exec("SET FOREIGN_KEY_CHECKS=1")
-
-	insertQueries, err := this.getInsertQueriesFromYml()
-
-	for _, insertQuerie := range insertQueries {
-		queryString, queryValues, err := insertQuerie.ToSql()
-
-		if err != nil {
-			return err
-		}
-
-		if _, err := this.db.Exec(queryString, queryValues...); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-//getInsertQueriesFromYml
-func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, error) {
-	var err error
-	insertQueries := []*squirrel.InsertBuilder{}
-
-	files, _ := ioutil.ReadDir(this.fixturesPathYml)
-
-	chData := make(chan *squirrel.InsertBuilder)
-	filesCount := cap(files)
-	chEnd := make(chan bool)
-
+	files, err := ioutil.ReadDir(this.fixturesPathYml)
 	if err != nil {
 		return nil, err
 	}
 
+	var resultSlice []os.FileInfo
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), ".yml") {
+			continue
+		}
+
+		resultSlice = append(resultSlice, file)
+	}
+
+	return resultSlice, nil
+}
+
+func (this *Fixturer) importYmlFixtures(files []os.FileInfo) error {
+	// The caller of the function must ensureDbConnected() and ensureDbDisconnected() afterwards.
+
+	log.Println("Import YML fixtures")
+	var mutex = &sync.Mutex{}
+
+	mutex.Lock()
+	if _, find := finishedParsedDirs[this.fixturesPathYml]; find {
+		this.loadParsedData()
+		mutex.Unlock()
+		return nil
+	}
+
+	mutex.Unlock()
+
+	this.pushInsertQueriesFromYmlToChannel(files)
+
+	finishedParsedDirs[this.fixturesPathYml] = struct{}{}
+
+	return this.loadParsedData()
+}
+
+func (this *Fixturer) loadParsedData() error {
+
+	if _, err := this.db.Exec("SET FOREIGN_KEY_CHECKS=0"); err != nil {
+		return err
+	}
+	defer this.db.Exec("SET FOREIGN_KEY_CHECKS=1")
+
+	for _, tableName := range finishedTablseNames {
+		_, err := this.db.Exec("TRUNCATE " + tableName)
+		if err != nil {
+			fmt.Println(err)
+			return err
+		}
+	}
+
+	tx, err := this.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, query := range insertMap {
+		queryString, queryValues, err := query.ToSql()
+
+		if err != nil {
+			fmt.Println(err)
+		}
+
+		if _, err := tx.Exec(queryString, queryValues...); err != nil {
+			fmt.Println(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		fmt.Println(err)
+		return err
+	}
+
+	return nil
+}
+
+func (this *Fixturer) pushInsertQueriesFromYmlToChannel(files []os.FileInfo) {
+	var wg sync.WaitGroup
+	wg.Add(len(files))
+
+	tablesNames := []string{}
+	var mutex = &sync.Mutex{}
+
 	for _, f := range files {
 		go func(f os.FileInfo) {
+			defer wg.Done()
+
 			filename := f.Name()
 			if strings.HasSuffix(filename, ".yml") == false {
 				return
@@ -181,121 +238,104 @@ func (this *Fixturer) getInsertQueriesFromYml() ([]*squirrel.InsertBuilder, erro
 			}
 
 			tableName := strings.TrimSuffix(filename, ".yml")
+			mutex.Lock()
+			tablesNames = append(tablesNames, tableName)
+			mutex.Unlock()
+
+			allKeysMap := map[string]struct{}{}
+			for _, item := range data {
+				for k := range item {
+					allKeysMap[k] = struct{}{}
+				}
+			}
+
+			allKeys := make([]string, 0, len(allKeysMap))
+
+			for k := range allKeysMap {
+				allKeys = append(allKeys, k)
+			}
+
+			qb := squirrel.Insert(tableName).Columns(allKeys...)
 
 			for _, item := range data {
-				keys := make([]string, 0, len(item))
-				values := make([]interface{}, 0, len(item))
-				for k, v := range item {
-					keys = append(keys, k)
-					values = append(values, v)
-				}
-
-				qb := squirrel.Insert(tableName).Columns(keys...).Values(values...)
-
-				chData <- qb
+				qb.AddMap(item)
 			}
-			chEnd <- true
+
+			mutex.Lock()
+			insertMap[filename] = qb
+			mutex.Unlock()
+
 			return
 		}(f)
 	}
 
-	i := 0
-	for {
-		select {
-		case insertQuerie := <-chData:
-			insertQueries = append(insertQueries, insertQuerie)
-		case endData := <-chEnd:
-			if endData == true {
-				i++
-				if i == filesCount {
-					return insertQueries, nil
-				}
+	wg.Wait()
+
+	mutex.Lock()
+	finishedTablseNames = tablesNames
+	mutex.Unlock()
+	return
+}
+
+func (this *Fixturer) ensureDbConnected() error {
+	if this.db != nil {
+		return nil
+	}
+	dsn := this.dbConf + this.dbName
+	if this.dbParams != "" {
+		dsn += "?" + this.dbParams
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(this.insertGoroutinesCnt)
+	db.SetMaxIdleConns(this.insertGoroutinesCnt)
+	if err := db.Ping(); err != nil {
+		return err
+	}
+	this.db = db
+	return nil
+}
+
+func (this *Fixturer) ensureDbDisconnected() {
+	// Ignore error.
+	_ = this.db.Close()
+	this.db = nil
+}
+
+func (this *Fixturer) LoadDbSchema() error {
+	log.Println("Load database schema")
+
+	if err := this.ensureDbConnected(); err != nil {
+		return err
+	}
+
+	tx, err := this.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	if _, err = tx.Exec("SET FOREIGN_KEY_CHECKS=0"); err != nil {
+		return err
+	}
+	defer tx.Exec("SET FOREIGN_KEY_CHECKS=1")
+
+	if file, err := ioutil.ReadFile(this.schema); err == nil {
+		queries := strings.Split(string(file), ";")
+
+		for i := range queries {
+			query := strings.TrimSpace(queries[i])
+			if len(query) == 0 {
+				continue
+			}
+			if _, err := tx.Exec(query); err != nil {
+				return err
 			}
 		}
-	}
-
-	return insertQueries, nil
-}
-
-//generateCsvFixtures
-func (this *Fixturer) generateCsvFixtures() error {
-	log.Println("Generate CSV fixtures")
-	suiteCsvFixturesPath := this.fixturesPathCsv + "/" + this.databaseSuffix
-
-	info, _ := os.Stat(suiteCsvFixturesPath)
-
-	if info != nil {
-		os.RemoveAll(suiteCsvFixturesPath)
-	}
-
-	err := os.MkdirAll(suiteCsvFixturesPath, 0777)
-	if err != nil {
-		return err
-
-	}
-
-	err = os.Chmod(suiteCsvFixturesPath, 0777)
-	if err != nil {
+		return tx.Commit()
+	} else {
 		return err
 	}
-
-	files, _ := ioutil.ReadDir(this.fixturesPathYml)
-	for _, f := range files {
-		tableName := strings.TrimSuffix(f.Name(), ".yml")
-		outFile := suiteCsvFixturesPath + "/" + tableName + ".csv"
-		query := "SELECT * FROM " + tableName + " INTO OUTFILE '" + outFile + "'"
-		_, err = this.db.Exec(query)
-
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-//LoadCsvFixtures
-func (this *Fixturer) LoadCsvFixtures() error {
-	log.Println("Load CSV fixtures")
-	var err error
-	_, err = this.db.Exec("SET FOREIGN_KEY_CHECKS=0")
-	if err != nil {
-		return err
-	}
-	defer this.db.Exec("SET FOREIGN_KEY_CHECKS=1")
-
-	suiteCsvFixturesPath := this.fixturesPathCsv + "/" + this.databaseSuffix
-
-	files, _ := ioutil.ReadDir(suiteCsvFixturesPath)
-
-	if cap(files) == 0 {
-		log.Printf("Empty %s dir", suiteCsvFixturesPath)
-	}
-
-	for _, f := range files {
-		filename := f.Name()
-		if strings.HasSuffix(filename, ".csv") == false {
-			continue
-		}
-
-		tableName := strings.TrimSuffix(filename, ".csv")
-
-		truncateQuery := "TRUNCATE " + tableName
-		_, err := this.db.Exec(truncateQuery)
-
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-
-		loadQuery := "LOAD DATA INFILE '" + suiteCsvFixturesPath + "/" + filename + "' INTO TABLE " + tableName
-		_, err = this.db.Exec(loadQuery)
-
-		if err != nil {
-			log.Println(err)
-			return err
-		}
-	}
-
-	return nil
 }
