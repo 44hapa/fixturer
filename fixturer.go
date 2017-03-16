@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 
-	"bitbucket.org/lazadaweb/squirrel"
 	"flag"
 	yaml "gopkg.in/yaml.v2"
 )
